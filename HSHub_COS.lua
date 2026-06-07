@@ -2683,11 +2683,62 @@ local function findNearestIn(folder, filter)
     return closest
 end
 
-local function findNearestFood() local i = interactions(); return i and findNearestIn(i:FindFirstChild('Food')) end
+local function findNearestFood(filter) local i = interactions(); return i and findNearestIn(i:FindFirstChild('Food'), filter) end
 local function findNearestMud()  local i = interactions(); return i and findNearestIn(i:FindFirstChild('Mud')) end
 local function findNearestLake() local i = interactions(); return i and findNearestIn(i:FindFirstChild('Lakes')) end
 local function findNearestToken()local i = interactions(); return i and findNearestIn(i:FindFirstChild('TokenNodes')) end
 local function findNearestEgg() local i = interactions(); return i and findNearestIn(i:FindFirstChild('AbandonedEggSpawns')) end
+
+-- ── DIET-AWARE EATING (2026-06-07, from HardcoreEnvScan): the creature's diet is the
+-- Character.Data attribute 'ft' (Carnivore/Herbivore/Omnivore/Photovore/Photocarnivore).
+-- We classify each food by FoodDataName and only eat what the diet allows -> NO 350-name list.
+local function creatureDiet()
+    local c = getChar(); if not c then return nil end
+    local d = c:FindFirstChild('Data')
+    local ft = (d and d:GetAttribute('ft')) or c:GetAttribute('ft')
+    return ft and tostring(ft):lower() or nil
+end
+local function foodCategory(fdn)
+    if not fdn then return 'other' end
+    local s = tostring(fdn):lower()
+    if s:find('carcass') or s:find('ribs') or s:find('meat') or s:find('flesh') then return 'meat' end
+    if s:find('algae') then return 'algae' end
+    if s:find('grass') or s:find('berr') or s:find('fruit') or s:find('seaweed') or s:find('grape')
+        or s:find('kelp') or s:find('moss') or s:find('plant') or s:find('leaf') or s:find('flower')
+        or s:find('shroom') or s:find('mushroom') or s:find('pods') then return 'plant' end
+    return 'other'
+end
+local DIET_FOOD = {
+    carnivore      = { meat = true },
+    herbivore      = { plant = true, algae = true },
+    omnivore       = { meat = true, plant = true, algae = true },
+    photovore      = { algae = true, plant = true },
+    photocarnivore = { meat = true, algae = true, plant = true },
+}
+local function foodAllowedFor(diet, fdn)
+    local allow = diet and DIET_FOOD[diet]
+    if not allow then return true end            -- unknown diet -> eat anything (safe fallback)
+    local cat = foodCategory(fdn)
+    if cat == 'other' then return true end       -- unclassified -> don't block a possibly-valid food
+    return allow[cat] == true
+end
+-- Drinkable-lake finder: hardcore NESTS lakes under sub-folders (e.g. "Poisoned") and flags
+-- IsPoisoned -> recurse all descendants, skip poisoned, return nearest Lake + its surface part.
+local function findDrinkableLake()
+    local i = interactions(); local lakes = i and i:FindFirstChild('Lakes'); if not lakes then return nil, nil end
+    local r = getRoot(); if not r then return nil, nil end
+    local best, bestPart, bestD = nil, nil, math.huge
+    for _, m in ipairs(lakes:GetDescendants()) do
+        if m:IsA('Model') and (m.Name == 'Lake' or m:GetAttribute('Water') ~= nil) and m:GetAttribute('IsPoisoned') ~= true then
+            local part = m:FindFirstChild('Surface') or m:FindFirstChild('WaterZone') or m.PrimaryPart or m:FindFirstChildWhichIsA('BasePart')
+            if part and part:IsA('BasePart') then
+                local d = (part.Position - r.Position).Magnitude
+                if d < bestD then best, bestPart, bestD = m, part, d end
+            end
+        end
+    end
+    return best, bestPart
+end
 
 -- ═══════════════════════════════════════════════════════════════════
 --   STATE TABLE
@@ -3058,7 +3109,8 @@ task.spawn(function()
             pcall(function()
                 local char = getChar()
                 if char and hudStatText('Hunger') ~= '100%' then
-                    local food = findNearestFood()
+                    local diet = creatureDiet()
+                    local food = findNearestFood(function(m) return foodAllowedFor(diet, m:GetAttribute('FoodDataName')) end)
                     if food then
                         local foodPart = food:IsA('Model') and (food.PrimaryPart or food:FindFirstChild('Food') or food:FindFirstChildWhichIsA('BasePart')) or food
                         if foodPart and foodPart:IsA('BasePart') then
@@ -3086,16 +3138,36 @@ task.spawn(function()
     end
 end)
 
--- AutoDrink: noted broken in LUNAR (probably lake-detection issue)
--- Still implemented for completeness; uses Lakes folder
+-- AutoDrink: was inconsistent because it fired DrinkRemote from wherever you stood
+-- (proximity-gated -> mostly ignored). Now TP onto the lake surface first, spam
+-- DrinkRemote until Thirst=100%, then snap back. Mirrors AutoEat.
 task.spawn(function()
+    local savedCF
     while true do
-        task.wait(0.1)
+        task.wait(1)
         if S.AutoDrink and not S.AutoMissions then
             pcall(function()
-                if getChar() and hudStatText('Thirst') ~= '100%' then
-                    local lake = findNearestLake()
-                    fire('DrinkRemote', lake)
+                local char = getChar()
+                if char and hudStatText('Thirst') ~= '100%' then
+                    local lake, lakePart = findDrinkableLake()
+                    if lake and lakePart then
+                        if lakePart:IsA('BasePart') then
+                            local target = lakePart.Position + Vector3.new(0, lakePart.Size.Y / 2 + 2, 0)  -- water surface
+                            local root = getRoot()
+                            if root then
+                                if not savedCF then savedCF = root.CFrame end
+                                root.CFrame = CFrame.new(target)
+                                local n = 0
+                                repeat
+                                    task.wait(0.1)
+                                    fire('DrinkRemote', lake)
+                                    if getRoot() then getRoot().CFrame = CFrame.new(target) end
+                                    n = n + 1
+                                until hudStatText('Thirst') == '100%' or not S.AutoDrink or not lake.Parent or n > 60
+                                if savedCF and getRoot() then getRoot().CFrame = savedCF; savedCF = nil end
+                            end
+                        end
+                    end
                 end
             end)
         end
@@ -3268,12 +3340,15 @@ local TABLET_POS = {
     Novus   = Vector3.new(1133.1, 857.9, 819.0),
     Garra   = Vector3.new(2333.9, 258.1, 1338.4),
     Eigion  = Vector3.new(1012.7, -508.9, 514.6),
+    -- Ardor + Angelic captured via ShrineHunter 2026-06-07 (user-verified TP, place 5233782396).
+    Angelic = Vector3.new(2143.02, 184.74, -1522.99),
+    Ardor   = Vector3.new(778.05, 202.18, -3425.92),
     -- Hardcore "Shadow" = 3 separate altars (ShrineHunter, PlaceId 136015760267602).
     -- User picks which via 3 toggles. All offer "Shadow" + share one cooldown.
     ['Shadow Up']     = Vector3.new( 1312.47, -64.96,  540.15),
     ['Shadow Middle'] = Vector3.new(  215.67, 404.63, -106.63),
     ['Shadow Down']   = Vector3.new(-1098.30, 327.13, -476.35),
-    -- Angelic + Ardor: auto-learned + saved when you first enter their regions.
+    -- (all 8 normal shrines now hardcoded; file auto-learn still merges any new finds.)
 }
 -- normalize to a list of candidate positions to try (in order)
 local function tabletPositions(name)
@@ -3505,7 +3580,7 @@ task.spawn(function()
                 end
                 if bestM and bestPart then
                     pcall(function() root.CFrame = bestPart.CFrame + Vector3.new(0, 4, 0) end)
-                    task.wait(0.8)                 -- settle before firing (anti-detect)
+                    task.wait(0.5)                 -- settle before firing (anti-detect; user-tuned 0.8->0.5)
                     if not bestLocked then
                         local full = getRemote('FoodPickup')
                         if full then pcall(function() full:InvokeServer(bestM) end) end
@@ -3525,7 +3600,7 @@ task.spawn(function()
             -- carrying now -> TP to shrine, WAIT to settle, offer, then snap BACK home.
             if held >= 1 then
                 pcall(function() root.CFrame = tablet.CFrame + Vector3.new(0, 6, 0) end)
-                task.wait(0.9)                     -- settle at the shrine before offering
+                task.wait(0.5)                     -- settle at the shrine before offering (user-tuned 0.9->0.5)
                 local wo = getRemote('WardenOffering')
                 if wo then pcall(function() wo:InvokeServer(offerNameOf(shrineName)) end) end
                 task.wait(0.4)
@@ -3607,12 +3682,31 @@ task.spawn(function()
     end
 end)
 
--- AutoGachaTokens: GetSpawnedTokenRemote:InvokeServer() — periodic pickup
+-- AutoGachaTokens: TP onto the nearest token node, settle, then GetSpawnedTokenRemote
+-- (proximity-safe, LUNAR-style save->TP->wait->act->TP-back, instead of firing from afar).
 task.spawn(function()
     while true do
         task.wait(0.5)
         if S.AutoGachaTokens then
-            pcall(function() invoke('GetSpawnedTokenRemote') end)
+            pcall(function()
+                local root = getRoot(); if not root then return end
+                local token = findNearestToken()
+                local part
+                if token then
+                    part = token:IsA('BasePart') and token
+                        or (token:IsA('Model') and (token.PrimaryPart or token:FindFirstChildWhichIsA('BasePart')))
+                end
+                if part then
+                    local home = root.CFrame
+                    pcall(function() root.CFrame = part.CFrame + Vector3.new(0, 4, 0) end)
+                    task.wait(0.5)                         -- settle before firing (anti-detect)
+                    pcall(function() invoke('GetSpawnedTokenRemote') end)
+                    task.wait(0.3)
+                    if getRoot() then pcall(function() getRoot().CFrame = home end) end   -- snap back
+                else
+                    pcall(function() invoke('GetSpawnedTokenRemote') end)   -- no token loaded -> fallback
+                end
+            end)
         end
     end
 end)
@@ -4023,14 +4117,30 @@ do
     end
     local function findPlayButton()    return findNamed('PlayButton')    end
     local function findRestartButton() return findNamed('RestartButton') end
+    -- confirm dialog button: scan ALL PlayerGui (popup may be a separate ScreenGui),
+    -- match Name OR Text against confirm terms, skip the RestartButton we just pressed,
+    -- and prefer the LOWEST match on screen (confirm sits below the trigger). Logs the
+    -- chosen button + tap coords so we can verify/correct from the status line.
+    local CONFIRM_TERMS = { 'confirm', 'konfirmasi', 'accept', 'terima', 'yes', 'ya', 'oke', 'ok', 'lanjut', 'setuju' }
     local function findConfirmish()
-        local g = findSaveGui(); if not g then return nil end
-        for _, d in ipairs(g:GetDescendants()) do
-            if (d:IsA('TextButton') or d:IsA('ImageButton')) and visibleChain(d) and d.AbsoluteSize.X < 260 then
-                local ln = d.Name:lower()
-                if ln:find('confirm') or ln:find('accept') or ln:find('yes') then return d end
+        local roots = { PG }
+        if gethui then local ok, h = pcall(gethui); if ok and h then roots[#roots + 1] = h end end
+        local best
+        for _, root in ipairs(roots) do
+            for _, d in ipairs(root:GetDescendants()) do
+                if (d:IsA('TextButton') or d:IsA('ImageButton')) and d.Name ~= 'RestartButton'
+                    and visibleChain(d) and d.AbsoluteSize.X > 0 and d.AbsoluteSize.X < 340 then
+                    local txt = ''; if d:IsA('TextButton') then pcall(function() txt = d.Text end) end
+                    local hay = (d.Name .. ' ' .. txt):lower()
+                    local hit = false
+                    for _, term in ipairs(CONFIRM_TERMS) do if hay:find(term, 1, true) then hit = true; break end end
+                    if hit and ((not best) or d.AbsolutePosition.Y > best.AbsolutePosition.Y) then best = d end
+                end
             end
         end
+        if best then local ap, az = best.AbsolutePosition, best.AbsoluteSize
+            statusSet(('confirm? [%s] c(%d,%d)'):format(best.Name, math.floor(ap.X + az.X / 2), math.floor(ap.Y + az.Y / 2))) end
+        return best
     end
     local function readSlots()
         local out = {}; local g = findSaveGui(); if not g then return out end
@@ -4126,6 +4236,15 @@ do
         end)
     end
 
+    -- reachable = tablet loaded NOW, OR a TP position is known (hardcoded / learned file).
+    -- Ardor & Angelic are NOT hardcoded (auto-learned) -> if unknown, skip so we don't
+    -- freeze trying to farm a shrine we can't navigate to.
+    local function shrineReachable(n)
+        if getShrineTablet(n) ~= nil then return true end
+        local ok, pos = pcall(tabletPositions, n)
+        return (ok and pos and #pos > 0) or false
+    end
+
     -- ═══ ORCHESTRATOR ═══
     local completed = {}            -- shrines deposited (cooldown) this life
     local lastInvis, lastHop = 0, 0
@@ -4154,20 +4273,31 @@ do
                         local order  = orderedShrines()
                         local target = math.min(5, #order)
                         local active
+                        local skipped = nil
                         for _, n in ipairs(order) do
                             if not completed[n] then
                                 local av = shrineAvailable(n)
-                                if av == false then completed[n] = true else active = n; break end
+                                if av == false then
+                                    completed[n] = true                 -- on cooldown = done this server
+                                elseif shrineReachable(n) then
+                                    active = n; break                   -- loaded / position known -> farm it
+                                else
+                                    skipped = skipped or n              -- unreachable (e.g. Ardor unknown) -> next
+                                end
                             end
                         end
                         local doneN = 0; for _ in pairs(completed) do doneN = doneN + 1 end
                         if doneN >= target then active = nil end
                         for n in pairs(S.ArtifactToggles) do S.ArtifactToggles[n] = (n == active) end
                         if not active then
-                            statusSet(('farm done %d/%d -> idle'):format(doneN, target))
-                            if S.AutoFarmHopWhenDone and (tick() - lastHop > 30) then lastHop = tick(); task.wait(1.5); serverHop() end
+                            if skipped then
+                                statusSet(('%s pos unknown - run ShrineHunter (%d/%d)'):format(skipped, doneN, target))
+                            else
+                                statusSet(('farm done %d/%d -> idle'):format(doneN, target))
+                                if S.AutoFarmHopWhenDone and (tick() - lastHop > 30) then lastHop = tick(); task.wait(1.5); serverHop() end
+                            end
                         else
-                            statusSet(('farming %s  (%d/%d done)'):format(active, doneN, target))
+                            statusSet(('farming %s (%d/%d done)'):format(active, doneN, target))
                         end
                     end
                 end)
@@ -4179,19 +4309,19 @@ do
     -- ═══ UI TAB ═══
     local Tab = Window:CreateTab('Autonomous', '🤖')
     local Sec = Tab:CreateSection('AUTONOMOUS FARM')
-    Sec:AddLabel('1) Calibrate Taps (once)  2) pick ONE mode. Runs from lobby OR in-game.', Color3.fromRGB(180, 220, 255))
-    local statusLbl = Sec:AddLabel('Status: idle', Color3.fromRGB(150, 205, 150))
+    Sec:AddLabel('Auto-calibrates on load. Just pick ONE mode. Runs from lobby OR in-game.', Color3.fromRGB(180, 220, 255))
+    local statusLbl = Sec:AddLabel('Status: starting...', Color3.fromRGB(150, 205, 150))
     statusSet = function(t) pcall(function() statusLbl:Set('Status: ' .. tostring(t)) end) end
-    Sec:AddButton({ Name = 'Calibrate Taps', Callback = function()
-        task.spawn(function()
-            panelHide()
-            statusSet('calibrating... (1 tap on our catcher; game untouched)')
-            local ok, off = autoCalibrate()
-            panelShow()
-            if ok then statusSet(('OK calibrated OFFSET=(%d,%d)'):format(math.floor(off.X), math.floor(off.Y)))
-            else statusSet('x calibrate failed: ' .. tostring(off)) end
-        end)
-    end })
+    -- auto-calibrate on load (no button): measure the tap OFFSET, retry, else keep default
+    task.spawn(function()
+        task.wait(3)
+        for _ = 1, 4 do
+            panelHide(); local ok, off = autoCalibrate(); panelShow()
+            if ok then statusSet(('auto-calibrated OFFSET=(%d,%d)'):format(math.floor(off.X), math.floor(off.Y))); return end
+            statusSet('auto-calibrate retry...'); task.wait(4)
+        end
+        statusSet(('calibrate failed - default OFFSET=(%d,%d)'):format(math.floor(OFFSET.X), math.floor(OFFSET.Y)))
+    end)
     Sec:AddToggle({ Name = 'Normal Mode (any creature)', Key = 'AutoNormalMode', Default = false,
         Tip = 'Spawn any ALIVE slot (restart if all dead), then farm priority shrines',
         Callback = function(v) S.AutoNormalMode = v; if v then S.AutoStealthMode = false end end })
