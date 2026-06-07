@@ -4170,11 +4170,14 @@ do
         return getChar() ~= nil
     end
     local function centerCard(s) if s and s.card then tapButton(s.card:FindFirstChild('ViewButton') or s.card, 'center ' .. s.slot) end end
-    local function waitInGame(sec) local t = tick(); repeat task.wait(0.5) until inGameNow() or tick() - t > sec; return inGameNow() end
+    -- "entered game" = the lobby's Play/Restart buttons are GONE (more reliable than a
+    -- character check: a dead creature can linger in workspace.Characters after death).
+    local function leftLobby() return findPlayButton() == nil and findRestartButton() == nil end
+    local function waitInGame(sec) local t = tick(); repeat task.wait(0.5) until leftLobby() or tick() - t > sec; return leftLobby() end
 
     -- ═══ spawn ONE creature for the mode (returns true if entered game) ═══
     local function spawnFor(mode)
-        if inGameNow() then return true end
+        if leftLobby() then return true end          -- lobby already closed = already in game
         local slots = readSlots()
         if #slots == 0 then statusSet('lobby not loaded (no slots)'); return false end
         local aliveTarget, deadTarget
@@ -4248,20 +4251,24 @@ do
     -- ═══ ORCHESTRATOR ═══
     local completed = {}            -- shrines deposited (cooldown) this life
     local lastInvis, lastHop = 0, 0
-    local busy = false
+    local busy, managing = false, false
     task.spawn(function()
         while true do
             task.wait(2)
             local mode = (S.AutoStealthMode and 'stealth') or (S.AutoNormalMode and 'normal') or nil
             if mode and (not busy) then
                 busy = true
+                managing = true
                 pcall(function()
-                    if not inGameNow() then
-                        -- LOBBY -> spawn (only once the lobby is actually loaded)
-                        if findPlayButton() or (#readSlots() > 0) then
-                            task.wait(0.6 + math.random())
-                            spawnFor(mode)
-                        end
+                    -- LOBBY vs IN-GAME by the lobby's OWN buttons: a visible Play/Restart
+                    -- button exists ONLY in the lobby. (inGameNow() alone is unreliable -- a
+                    -- dead creature lingers in workspace.Characters after returning to the
+                    -- lobby -> falsely "in game" -> it would FARM instead of SPAWN.)
+                    local atLobby = (findPlayButton() ~= nil) or (findRestartButton() ~= nil)
+                    if atLobby then
+                        -- LOBBY -> spawn
+                        task.wait(0.6 + math.random())
+                        spawnFor(mode)
                         completed = {}                 -- fresh life resets shrine completion
                     else
                         -- IN GAME -> hide-scent (+ stealth invis) + priority farm + hop
@@ -4302,6 +4309,12 @@ do
                     end
                 end)
                 busy = false
+            elseif (not mode) and managing then
+                -- autonomous just turned OFF -> stop the farm IT started (clear the shrine
+                -- toggles the orchestrator set, so the artifact-farm loop goes idle again).
+                managing = false
+                for n in pairs(S.ArtifactToggles) do S.ArtifactToggles[n] = false end
+                statusSet('autonomous OFF (farm stopped)')
             end
         end
     end)
